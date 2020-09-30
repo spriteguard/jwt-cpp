@@ -18,6 +18,11 @@
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
 
+#ifdef ENABLE_PKCS11_OPENSC
+#include <dlfcn.h>
+#include <pkcs11/pkcs11.h>
+#endif
+
 #include <chrono>
 #include <memory>
 #include <set>
@@ -63,6 +68,9 @@ namespace jwt {
 		struct signature_generation_exception : public std::system_error {
 			using system_error::system_error;
 		};
+		struct pkcs11_exception : public std::system_error {
+			using system_error::system_error;
+		};
 		struct rsa_exception : public std::system_error {
 			using system_error::system_error;
 		};
@@ -72,6 +80,67 @@ namespace jwt {
 		struct token_verification_exception : public std::system_error {
 			using system_error::system_error;
 		};
+		/**
+		 * @brief Error related to PKCS#11 functions
+		 */
+		enum class pkcs11_error {
+			ok = 0,
+			load_module_failed = 10,
+			initialization_failed,
+			get_slot_list,
+			no_token_available,
+			token_info,
+			token_not_initialized,
+			pin_required,
+			open_session,
+			login,
+			find_objects_init,
+			find_objects,
+			no_private_key,
+			mechanism_list,
+			malloc,
+			mechanism_not_supported,
+			sign_init,
+			sign
+		};
+		/**
+		 * @brief Errorcategory for PKCS#11 errors
+		 */
+		inline std::error_category& pkcs11_error_category() {
+			class pkcs11_error_cat : public std::error_category
+			{
+			public:
+				const char* name() const noexcept override { return "pkcs11_error"; }
+				std::string message(int ev) const override {
+					switch(static_cast<pkcs11_error>(ev)) {
+					case pkcs11_error::ok: return "no error";
+					case pkcs11_error::load_module_failed: return "failed to load module";
+					case pkcs11_error::initialization_failed: return "initialization_failed";
+					case pkcs11_error::get_slot_list: return "get_slot_list";
+					case pkcs11_error::no_token_available: return "no_token_available";
+					case pkcs11_error::token_not_initialized: return "token_not_initialized";
+					case pkcs11_error::token_info: return "token_info";
+					case pkcs11_error::pin_required: return "pin_required";
+					case pkcs11_error::open_session: return "open_session";
+					case pkcs11_error::login: return "login";
+					case pkcs11_error::find_objects_init: return "find_objects_init";
+					case pkcs11_error::find_objects: return "find_objects";
+					case pkcs11_error::no_private_key: return "no_private_key";
+					case pkcs11_error::mechanism_list: return "mechanism_list";
+					case pkcs11_error::malloc: return "malloc";
+					case pkcs11_error::mechanism_not_supported: return "mechanism_not_supported";
+					case pkcs11_error::sign_init: return "sign_init";
+					case pkcs11_error::sign: return "sign";
+					default: return "unknown pkcs11 error";
+					}
+				}
+			};
+			static pkcs11_error_cat cat;
+			return cat;
+		}
+		inline std::error_code make_error_code(pkcs11_error e) {
+			return {static_cast<int>(e), pkcs11_error_category()};
+		}
 		/**
 		 * \brief Error related to processing of RSA signatures
 		 */
@@ -298,6 +367,8 @@ namespace jwt {
 					throw signature_generation_exception(ec);
 				if(ec.category() == token_verification_error_category())
 					throw token_verification_exception(ec);
+				if(ec.category() == pkcs11_error_category())
+					throw pkcs11_exception(ec);
 			}
 		}
 	}
@@ -305,6 +376,7 @@ namespace jwt {
 	// Keep backward compat at least for a couple of revisions
 	using error::signature_verification_exception;
 	using error::signature_generation_exception;
+	using error::pkcs11_exception;
 	using error::rsa_exception;
 	using error::ecdsa_exception;
 	using error::token_verification_exception;
@@ -313,6 +385,8 @@ namespace std
 {
 	template <>
 	struct is_error_code_enum<jwt::error::rsa_error> : true_type {};
+	template <>
+	struct is_error_code_enum<jwt::error::pkcs11_error> : true_type {};
 	template <>
 	struct is_error_code_enum<jwt::error::ecdsa_error> : true_type {};
 	template <>
@@ -519,6 +593,150 @@ namespace jwt {
 		}
 	}  // namespace helper
 
+#ifdef ENABLE_PKCS11_OPENSC
+	/**
+	 * @brief Functions for dealing with PKCS#11 Smartcards
+	 */
+	namespace pkcs11 {
+		struct token {
+			token(const std::string& provider_module, const std::string &object_label, const std::string& token_pin, const CK_MECHANISM_TYPE mechanism)
+					: pin(token_pin), mech{.mechanism = mechanism}, object_id(object_label)
+			{
+				if (!load_pkcs11_library(provider_module))
+					throw pkcs11_exception(error::pkcs11_error::load_module_failed);
+				if (p11->C_Initialize(NULL) != CKR_OK)
+					throw pkcs11_exception(error::pkcs11_error::initialization_failed);
+
+				//TODO: allow multiple slots
+				CK_ULONG slot_count = 1;
+				if (p11->C_GetSlotList(CK_TRUE, &slot, &slot_count) != CKR_OK)
+					throw pkcs11_exception(error::pkcs11_error::get_slot_list);
+				if (slot_count == 0)
+					throw pkcs11_exception(error::pkcs11_error::no_token_available);
+
+				CK_TOKEN_INFO info;
+				if (p11->C_GetTokenInfo(slot, &info) != CKR_OK)
+					throw pkcs11_exception(error::pkcs11_error::token_info);
+				if (!(info.flags & CKF_TOKEN_INITIALIZED))
+					throw pkcs11_exception(error::pkcs11_error::token_not_initialized);
+				if (info.flags & CKF_LOGIN_REQUIRED) {
+					if (pin.empty())
+						throw pkcs11_exception(error::pkcs11_error::pin_required);
+					pin = token_pin;
+				}
+
+				//TODO: Check mechanism is supported
+			}
+			~token()
+			{
+				if( dlhandle )
+					dlclose(dlhandle);
+			}
+
+			bool sign(std::string &hash, std::string &res, std::error_code &ec)
+			{
+				bool ret = true;
+				CK_ULONG len = 0;
+				res.resize((len=512));
+
+				CK_SESSION_HANDLE sess = session(true, ec);
+				if (sess == CK_INVALID_HANDLE) {
+					ret = false;
+				}
+				else if (p11->C_SignInit(sess, &mech, object_handle) != CKR_OK) {
+					ec = error::pkcs11_error::sign_init;
+					ret = false;
+				}
+				else if (p11->C_Sign(sess, (unsigned char *)hash.data(), hash.size(), (unsigned char *)res.data(), &len) != CKR_OK) {
+					ec = error::pkcs11_error::sign;
+					ret = false;
+				}
+
+				res.resize(len);
+				p11->C_CloseSession(sess);
+				return ret;
+			}
+
+			bool verify(std::string &hash, std::string &res, std::error_code &ec)
+			{
+				CK_SESSION_HANDLE sess = session(false, ec);
+
+			// bool verify()
+			// {
+			// 	if (!find_object(session, CKO_PUBLIC_KEY, &object, object_id, object_id.size(), 0) &&
+			// 		!find_object(session, CKO_CERTIFICATE, &object, object_id, object_id.size(), 0))
+			// 		throw pkcs11_exception(error::pkcs11_error::no_private_key);
+			// }
+
+				return false;
+			}
+
+		private:
+			bool load_pkcs11_library(std::string library_path)
+			{
+				dlhandle = dlopen(library_path.c_str(), RTLD_NOW);
+				if (dlhandle == nullptr) {
+					return false;
+				}
+
+				void* fn = dlsym(dlhandle, "C_GetFunctionList");
+				if (fn == nullptr) {
+					return false;
+				}
+
+				return (((CK_C_GetFunctionList)fn)(&p11) == CKR_OK);
+			}
+
+			CK_SESSION_HANDLE session(bool rw, std::error_code &ec)
+			{
+				CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+				CK_FLAGS flags = CKF_SERIAL_SESSION | (rw ? CKF_RW_SESSION : 0);
+				if (p11->C_OpenSession(slot, flags, NULL, NULL, &session) != CKR_OK) {
+					ec = error::pkcs11_error::open_session;
+					return CK_INVALID_HANDLE;
+				}
+				if (!pin.empty()) {
+					if (p11->C_Login(session, CKU_USER, (CK_UTF8CHAR *)pin.c_str(), pin.length()) != CKR_OK) {
+						ec = error::pkcs11_error::login;
+						return CK_INVALID_HANDLE;
+					}
+				}
+
+				CK_OBJECT_CLASS objClass = CKO_PRIVATE_KEY;
+				CK_ATTRIBUTE attrs[2] = {
+						{ .type = CKA_CLASS, .pValue = &objClass, .ulValueLen = sizeof(objClass)},
+						{ .type = CKA_LABEL, .pValue = (void *)object_id.c_str(), .ulValueLen = object_id.length()}
+					};
+				if (p11->C_FindObjectsInit(session, attrs, 2) != CKR_OK) {
+					ec = error::pkcs11_error::find_objects_init;
+					return CK_INVALID_HANDLE;
+				}
+				CK_ULONG count;
+				if (p11->C_FindObjects(session, &object_handle, 1, &count) != CKR_OK) {
+					ec = error::pkcs11_error::find_objects;
+					return CK_INVALID_HANDLE;
+				}
+				p11->C_FindObjectsFinal(session);
+				if (count == 0) {
+					ec = error::pkcs11_error::no_private_key;
+					return CK_INVALID_HANDLE;
+				}
+
+				return session;
+			}
+
+			void *dlhandle{NULL};
+			CK_FUNCTION_LIST_PTR p11{NULL};
+			CK_SLOT_ID slot;
+			std::string pin;
+			std::string object_id;
+			CK_OBJECT_HANDLE object_handle{CK_INVALID_HANDLE};
+			CK_MECHANISM mech{0};
+		};
+	}
+#endif
+
+
 	/**
 	 * \brief Various cryptographic algorithms when working with JWT
 	 * 
@@ -649,6 +867,14 @@ namespace jwt {
 				} else
 					throw rsa_exception(error::rsa_error::no_key_provided);
 			}
+#ifdef ENABLE_PKCS11_OPENSC
+			rsa(const std::string& provider_module, const std::string& object_label, const std::string& user_pin, const CK_MECHANISM_TYPE mechanism, const EVP_MD*(*md)(), std::string name)
+				: md(md), alg_name(std::move(name))
+			{
+				pkcs11_token = std::make_shared<pkcs11::token>(provider_module, object_label, user_pin, mechanism);
+			}
+#endif
+
 			/**
 			 * Sign jwt data
 			 * \param data The data to sign
@@ -671,20 +897,38 @@ namespace jwt {
 					return {};
 				}
 
-				std::string res;
-				res.resize(EVP_PKEY_size(pkey.get()));
-				unsigned int len = 0;
 
 				if (!EVP_SignUpdate(ctx.get(), data.data(), data.size())){
 					ec = error::signature_generation_error::signupdate_failed;
 					return {};
 				}
-				if (EVP_SignFinal(ctx.get(), (unsigned char*)res.data(), &len, pkey.get()) == 0)  { // NOLINT(google-readability-casting) requires `const_cast`
-					ec = error::signature_generation_error::signfinal_failed;
-					return {};
+
+				std::string res;
+				unsigned int len = 0;
+
+#ifdef ENABLE_PKCS11_OPENSC
+				if (pkcs11_token) {
+					std::string hash;
+					len = EVP_MD_size(md());
+					hash.resize(len);
+					EVP_DigestFinal(ctx.get(), (unsigned char*)hash.data(), &len);
+					if (!pkcs11_token->sign(hash, res, ec)) {
+						return {};
+					}
+				}
+				else
+#endif
+				{
+					res.resize(EVP_PKEY_size(pkey.get()));
+
+					if (EVP_SignFinal(ctx.get(), (unsigned char*)res.data(), &len, pkey.get()) == 0)  { // NOLINT(google-readability-casting) requires `const_cast`
+						ec = error::signature_generation_error::signfinal_failed;
+						return {};
+					}
+
+					res.resize(len);
 				}
 
-				res.resize(len);
 				return res;
 			}
 			/**
@@ -732,6 +976,9 @@ namespace jwt {
 			const EVP_MD*(*md)();
 			/// algorithm's name
 			const std::string alg_name;
+#ifdef ENABLE_PKCS11_OPENSC
+			std::shared_ptr<pkcs11::token> pkcs11_token;
+#endif
 		};
 		/**
 		 * \brief Base class for ECDSA family of algorithms
@@ -1102,6 +1349,19 @@ namespace jwt {
 				: rsa(public_key, private_key, public_key_password, private_key_password, EVP_sha256, "RS256")
 			{}
 		};
+#ifdef ENABLE_PKCS11_OPENSC
+		struct rs256_pkcs11 : public rsa {
+			/**
+			 * Construct new instance of algorithm
+			 * \param provider_module PKCS#11 shared library
+			 * \param user_pin Token User PIN if required
+			 */
+			explicit rs256_pkcs11(const std::string& provider_module, const std::string& object_label, const std::string& user_pin = "")
+				: rsa(provider_module, object_label, user_pin, CKM_SHA256_RSA_PKCS, EVP_sha256, "RS256")
+			{}
+		};
+#endif
+
 		/**
 		 * RS384 algorithm
 		 */
