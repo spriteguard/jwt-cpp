@@ -602,9 +602,11 @@ namespace jwt {
 			token(const std::string& provider_module, const std::string &object_label, const std::string& token_pin, const CK_MECHANISM_TYPE mechanism)
 					: pin(token_pin), mech{.mechanism = mechanism}, object_id(object_label)
 			{
+				CK_RV rv;
 				if (!load_pkcs11_library(provider_module))
 					throw pkcs11_exception(error::pkcs11_error::load_module_failed);
-				if (p11->C_Initialize(NULL) != CKR_OK)
+				rv = p11->C_Initialize(NULL);
+				if (rv != CKR_OK && rv != CKR_CRYPTOKI_ALREADY_INITIALIZED)
 					throw pkcs11_exception(error::pkcs11_error::initialization_failed);
 
 				//TODO: allow multiple slots
