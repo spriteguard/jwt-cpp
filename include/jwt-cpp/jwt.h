@@ -661,7 +661,7 @@ namespace jwt {
 
 			bool verify(std::string &hash, std::string &res, std::error_code &ec)
 			{
-				CK_SESSION_HANDLE sess = session(false, ec);
+				// CK_SESSION_HANDLE sess = session(false, ec);
 
 			// bool verify()
 			// {
@@ -730,10 +730,11 @@ namespace jwt {
 			void *dlhandle{NULL};
 			CK_FUNCTION_LIST_PTR p11{NULL};
 			CK_SLOT_ID slot;
-			std::string pin;
-			std::string object_id;
 			CK_OBJECT_HANDLE object_handle{CK_INVALID_HANDLE};
+
+			std::string pin;
 			CK_MECHANISM mech{0};
+			std::string object_id;
 		};
 	}
 #endif
